@@ -37,6 +37,24 @@ serology_train_df <- serology_train_feature_df_filtered %>%
   janitor::clean_names() %>% 
   arrange(participant_id)
 
+
+serology_test_feature_df_filtered <- serology_test %>%
+  semi_join(
+    serology_common_feature_df,
+    by = c("timepoint", "virus_strain", "assay")
+  )
+
+serology_test_df <- serology_test_feature_df_filtered %>%
+  pivot_wider(
+    id_cols = participant_id,
+    names_from = c(timepoint, virus_strain, assay),
+    values_from = value,
+    names_sep = "_"
+  ) %>% 
+  janitor::clean_names() %>% 
+  arrange(participant_id)
+
 saveRDS(serology_train_df, file = fs::path(processed_data_path, "serology_train_df.rds"))
+saveRDS(serology_test_df, file = fs::path(processed_data_path, "serology_test_df.rds"))
 
 rm(list = ls())
