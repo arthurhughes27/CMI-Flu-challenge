@@ -171,7 +171,6 @@ vaccine_history_test_df <- vaccine_history_test_df %>%
   select(subject, all_of(vaccine_history_features))
 
 
-
 # ==============================================================================
 # HLA processing
 # ==============================================================================
