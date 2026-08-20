@@ -1,10 +1,19 @@
 # ==============================================================================
 # task2.1_feature_set_comparison.R
 # Compare demographic, cytokine, cytometry, and serology feature sets as
-# predictors of Task 2.1 (Day-28 HAI antibody magnitude), using
-# predictomics::compare_pipelines(). Every pipeline (reference and each
-# feature-set option) shares the same configuration: z-score engineering, no
-# feature selection, elastic net (glmnet) modelling.
+# predictors of Task 2.1 (Day-28 HAI antibody magnitude).
+#
+# The four feature sets do not share a common set of participants with the
+# response (no participant has every feature set measured), so
+# predictomics::compare_pipelines(option_type = "predictors") cannot be used
+# directly - it requires every option's predictor matrix to share one fixed
+# Y (i.e. the same n and row order across all options). Instead, each feature
+# set is fit via its own predict_cv() call, restricted to the participants it
+# shares with the response, and the resulting metrics are combined into a
+# single comparison plot. The reference pipeline (z-score engineering, no
+# feature selection, elastic net modelling) and a per-feature-set baseline
+# (X = NULL, mean-only) are identical in spirit to what compare_pipelines()
+# would have produced, just computed by hand across differing sample sizes.
 # ==============================================================================
 
 library(tidyverse)
@@ -37,88 +46,140 @@ feature_sets <- list(
   serology    = serology_df
 )
 
+reference_pipeline <- list(
+  engineering_params = list(method = "engineer", col_transform = "z"),
+  selection_params   = NULL,
+  model_params       = list(method = "glmnet", impute = "mean")
+)
+
 
 # ==============================================================================
-# Restrict to participants with the response and every feature set available,
-# and align row order across Y and every predictor matrix
+# Fit a baseline (X = NULL) and the reference pipeline for one feature set,
+# restricted to the participants it shares with the response
 # ==============================================================================
 
-common_ids <- Reduce(
-  intersect,
-  c(list(response_df$participant_id),
-    lapply(feature_sets, function(df) df$participant_id))
-) %>%
-  sort()
+fit_feature_set <- function(feature_set_name, df, response_df,
+                            reference_pipeline, folds = 10L, seed = 12345L) {
 
-response_aligned <- response_df %>%
-  filter(participant_id %in% common_ids) %>%
-  arrange(participant_id)
+  common_ids <- intersect(response_df$participant_id, df$participant_id) %>%
+    sort()
 
-Y <- response_aligned$value
-names(Y) <- response_aligned$participant_id
+  response_aligned <- response_df %>%
+    filter(participant_id %in% common_ids) %>%
+    arrange(participant_id)
 
-to_aligned_matrix <- function(df) {
-  df %>%
+  Y <- response_aligned$value
+  names(Y) <- response_aligned$participant_id
+
+  X <- df %>%
     filter(participant_id %in% common_ids) %>%
     arrange(participant_id) %>%
     tibble::column_to_rownames("participant_id") %>%
     as.matrix()
+
+  stopifnot(identical(rownames(X), names(Y)))
+
+  n_folds <- min(folds, length(Y))
+
+  baseline_fit <- suppressMessages(predict_cv(
+    Y       = Y,
+    X       = NULL,
+    cv_type = "kfold",
+    folds   = n_folds,
+    seed    = seed,
+    verbose = FALSE
+  ))
+
+  model_fit <- suppressMessages(predict_cv(
+    Y                  = Y,
+    X                  = X,
+    cv_type            = "kfold",
+    folds              = n_folds,
+    seed               = seed,
+    engineering_params = reference_pipeline$engineering_params,
+    selection_params   = reference_pipeline$selection_params,
+    model_params       = reference_pipeline$model_params,
+    verbose            = FALSE
+  ))
+
+  bind_rows(
+    tibble(feature_set = feature_set_name, role = "baseline", n = length(Y),
+           !!!as.list(metrics(baseline_fit))),
+    tibble(feature_set = feature_set_name, role = "model", n = length(Y),
+           !!!as.list(metrics(model_fit)))
+  )
 }
 
-X_list <- lapply(feature_sets, to_aligned_matrix)
 
-stopifnot(
-  all(vapply(X_list, nrow, integer(1)) == length(Y)),
-  all(vapply(X_list, function(m) identical(rownames(m), names(Y)), logical(1)))
-)
+# ==============================================================================
+# Fit every feature set and combine metrics
+# ==============================================================================
 
-# Combined predictor matrix (all feature sets together), used as the fixed
-# "Reference" predictor set that each individual feature set is compared
-# against; columns are prefixed by feature set to avoid name clashes.
-X_combined <- do.call(cbind, Map(function(name, m) {
-  colnames(m) <- paste0(name, "_", colnames(m))
-  m
-}, names(X_list), X_list))
+results <- purrr::imap(feature_sets, function(df, name) {
+  message("[task2.1] Fitting feature set: ", name)
+  fit_feature_set(name, df, response_df, reference_pipeline)
+}) %>%
+  bind_rows()
+
+print(results)
 
 
 # ==============================================================================
-# Compare feature sets under a shared reference pipeline:
-# z-score engineering, no feature selection, elastic net modelling.
-# model_params$impute = "mean" guards against sporadic missing values within
-# a participant's feature set (e.g. an analyte not measured for them).
+# Plot: metrics compared across feature sets, baseline vs. reference pipeline
+# (z-score engineering, no selection, elastic net). Each feature set is fit
+# on its own overlap with the response, so sample size (n) differs by set -
+# this is annotated on the x-axis.
 # ==============================================================================
 
-reference_pipeline <- list(
-  engineering_params = list(method = "engineer", col_transform = "z"),
-  selection_params   = NULL,
-  model_params        = list(method = "glmnet", impute = "mean")
-)
+plot_df <- results %>%
+  mutate(feature_set_label = paste0(feature_set, "\n(n = ", n, ")")) %>%
+  pivot_longer(
+    cols      = c(RMSE, sRMSE, R2, SpearmanR),
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric, levels = c("RMSE", "sRMSE", "R2", "SpearmanR")),
+    role   = factor(role, levels = c("baseline", "model"),
+                    labels = c("Baseline (mean-only)",
+                               "z-score + elastic net"))
+  )
 
-comparison <- compare_pipelines(
-  Y                = Y,
-  X                = X_combined,
-  option_type      = "predictors",
-  option_choices   = X_list,
-  reference_params = reference_pipeline,
-  cv_type          = "kfold",
-  folds            = 10L,
-  seed             = 12345L,
-  metric           = "sRMSE",
-  verbose          = TRUE
-)
+comparison_plot <- ggplot(plot_df, aes(x = feature_set_label, y = value, fill = role)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_text(
+    aes(label = round(value, 3)),
+    position = position_dodge(width = 0.7), vjust = -0.4, size = 3
+  ) +
+  facet_wrap(~metric, scales = "free_y") +
+  labs(
+    x        = "Feature set",
+    y        = NULL,
+    fill     = "Pipeline",
+    title    = "Task 2.1 (antibody magnitude): feature set comparison",
+    subtitle = paste0(
+      "Each feature set fit on its own overlap of participants with the ",
+      "response (n differs by set)"
+    )
+  ) +
+  theme_bw() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(colour = "grey40", size = 10),
+    axis.text.x      = element_text(size = 9),
+    legend.position  = "bottom"
+  )
 
-print(comparison)
-
-comparison_plot <- plot(comparison, metric = "all")
+comparison_plot
 
 
 # ==============================================================================
 # Save results
 # ==============================================================================
 
-saveRDS(comparison, fs::path(results_path, "task2.1_feature_set_comparison.rds"))
+saveRDS(results, fs::path(results_path, "task2.1_feature_set_comparison.rds"))
 
-ggplot2::ggsave(
+ggsave(
   filename = fs::path(results_path, "task2.1_feature_set_comparison.png"),
   plot     = comparison_plot,
   width    = 10, height = 7, dpi = 300
