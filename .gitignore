@@ -3,6 +3,7 @@ data/
 data-raw/
 manuscript/
 output/
+papers/
 
 # History files
 .Rhistory
